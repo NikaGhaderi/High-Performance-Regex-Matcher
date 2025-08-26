@@ -1,0 +1,13 @@
+# Compiled Object files
+*.o
+
+# Executables
+regex_matcher
+gpu_matcher
+
+# Output files
+*.txt
+*.csv
+
+# Ignore build directories from source builds (like Hyperscan)
+/build/
