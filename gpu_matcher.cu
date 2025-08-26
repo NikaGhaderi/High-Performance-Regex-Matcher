@@ -33,45 +33,170 @@ struct Match {
     int pattern_id;
 };
 
+// Enum for NFA state types
+enum StateType {
+    MATCH = 256, // Marks a match state
+    SPLIT = 257  // Marks a split (choice) state
+};
+
+// Represents a single state in the NFA
+struct NfaState {
+    int c;      // Character for transition, or StateType
+    int next1;  // Index of the next state
+    int next2;  // Index of the second next state (for SPLIT)
+};
+
+// Represents a fragment of an NFA (a start and end point)
+struct NfaFragment {
+    int start;
+    int end;
+};
+
+// ==================================================================================
+// NFA COMPILER (HOST-SIDE)
+// ==================================================================================
+
+/**
+ * @brief Compiles a regex pattern string into an NFA graph.
+ * This runs on the host (CPU) to prepare the NFAs for the GPU.
+ * @param pattern The regex string.
+ * @param nfa_states The vector to be filled with NFA states.
+ * @return The starting state index for this pattern's NFA.
+ */
+int compile_pattern_to_nfa(const std::string& pattern, std::vector<NfaState>& nfa_states) {
+    std::vector<NfaFragment> stack;
+    int nstates = 0;
+
+    auto add_state = [&](int c, int n1, int n2) {
+        nfa_states.push_back({c, n1, n2});
+        return nstates++;
+    };
+
+    for (char p_char : pattern) {
+        if (p_char == '*') {
+            NfaFragment frag = stack.back();
+            stack.pop_back();
+            int s = add_state(SPLIT, frag.start, -1); // Placeholder for next state
+            nfa_states[frag.end].c = SPLIT;
+            nfa_states[frag.end].next1 = s;
+            nfa_states[frag.end].next2 = frag.start;
+            stack.push_back({s, s});
+        } else { // Handles literal characters and '.'
+            int s = add_state(p_char, -1, -1);
+            stack.push_back({s, s});
+        }
+    }
+
+    // Concatenate fragments
+    for (size_t i = 1; i < stack.size(); ++i) {
+        nfa_states[stack[i-1].end].next1 = stack[i].start;
+    }
+
+    int start_node = stack.empty() ? -1 : stack[0].start;
+    if (!stack.empty()) {
+        int match_state = add_state(MATCH, -1, -1);
+        nfa_states[stack.back().end].next1 = match_state;
+        // Patch up dangling '*' fragments
+        for(size_t i = 0; i < nfa_states.size(); ++i) {
+            if(nfa_states[i].c == SPLIT && nfa_states[i].next2 == -1) {
+                nfa_states[i].next2 = match_state;
+            }
+        }
+    } else {
+        start_node = add_state(MATCH, -1, -1);
+    }
+
+    return start_node;
+}
+
+
 // ==================================================================================
 // GPU KERNEL AND DEVICE FUNCTIONS
 // ==================================================================================
 
+// State structure for iterative regex matching
+struct RegexState {
+    int pattern_pos;
+    int text_pos;
+};
+
 /**
- * @brief A simple device-side function to check if a pattern matches a text.
- * This is a simplified regex engine that supports:
+ * @brief A stack-based iterative regex matcher for GPU.
+ * This eliminates recursion to avoid stack overflow issues on GPU threads.
+ * Supports the same features as the recursive version:
  * - Literal characters (e.g., 'a', 'b', 'c')
  * - '.' (dot) which matches any single character.
  * - '*' (star) which matches zero or more of the preceding character.
- * It does NOT support more complex features like character classes, groups, etc.
  *
  * @param pattern The pattern string.
  * @param text The text string to match against.
  * @return True if the pattern is found within the text, false otherwise.
  */
 __device__ bool simple_regex_match(const char* pattern, const char* text) {
-    if (pattern[0] == '\0') return true;
-
-    // If the next character is not '*', we must have a match at the current position
-    if (pattern[1] != '*') {
-        if (text[0] != '\0' && (pattern[0] == '.' || pattern[0] == text[0])) {
-            return simple_regex_match(pattern + 1, text + 1);
+    // Calculate pattern and text lengths
+    int pattern_len = 0;
+    int text_len = 0;
+    while (pattern[pattern_len] != '\0') pattern_len++;
+    while (text[text_len] != '\0') text_len++;
+    
+    // Stack for simulating recursion - size based on max possible depth
+    // Worst case: pattern_len + text_len recursive calls
+    const int MAX_STACK_SIZE = 512; // Reasonable limit for GPU threads
+    RegexState stack[MAX_STACK_SIZE];
+    int stack_top = 0;
+    
+    // Initialize with starting state
+    stack[0] = {0, 0};
+    stack_top = 1;
+    
+    while (stack_top > 0) {
+        // Pop current state
+        stack_top--;
+        RegexState current = stack[stack_top];
+        int pat_pos = current.pattern_pos;
+        int text_pos = current.text_pos;
+        
+        // Base case: reached end of pattern
+        if (pat_pos >= pattern_len) {
+            return true; // Successfully matched entire pattern
         }
-        return false;
+        
+        // Check if we have space for more states (prevent stack overflow)
+        if (stack_top >= MAX_STACK_SIZE - 2) {
+            continue; // Skip this branch to avoid overflow
+        }
+        
+        // Get current pattern character
+        char pat_char = pattern[pat_pos];
+        
+        // Check if next character is '*'
+        bool next_is_star = (pat_pos + 1 < pattern_len) && (pattern[pat_pos + 1] == '*');
+        
+        if (!next_is_star) {
+            // Simple character match (no star)
+            if (text_pos < text_len && (pat_char == '.' || pat_char == text[text_pos])) {
+                // Match found, advance both pattern and text
+                stack[stack_top] = {pat_pos + 1, text_pos + 1};
+                stack_top++;
+            }
+            // If no match, this path fails (don't push anything)
+        } else {
+            // Handle '*' case (zero or more matches)
+            
+            // Option 1: Match zero instances (skip pattern character and '*')
+            stack[stack_top] = {pat_pos + 2, text_pos};
+            stack_top++;
+            
+            // Option 2: Match one or more instances (if current character matches)
+            if (text_pos < text_len && (pat_char == '.' || pat_char == text[text_pos])) {
+                // Stay on same pattern position, advance text
+                stack[stack_top] = {pat_pos, text_pos + 1};
+                stack_top++;
+            }
+        }
     }
-
-    // Handle the '*' case (zero or more matches of the preceding character)
-    // Try to match the rest of the pattern (zero instances)
-    if (simple_regex_match(pattern + 2, text)) {
-        return true;
-    }
-
-    // Try to match one or more instances
-    if (text[0] != '\0' && (pattern[0] == '.' || pattern[0] == text[0])) {
-        return simple_regex_match(pattern, text + 1);
-    }
-
-    return false;
+    
+    return false; // No path led to a complete match
 }
 
 /**
@@ -256,13 +381,6 @@ int main(int argc, char* argv[]) {
         std::cerr << "Usage: " << argv[0] << " <patterns_file> <input_file> <output_file> <metrics_file>" << std::endl;
         return 1;
     }
-
-    // --- Increase the stack size ---
-    // Default is small (e.g., 1KB). Let's increase it to 8KB to test the hypothesis.
-    size_t new_stack_size = 8192;
-    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, new_stack_size));
-    printf("Set CUDA device stack size to %zu bytes.\n", new_stack_size);
-
 
     std::string patterns_file = argv[1];
     std::string input_file = argv[2];
