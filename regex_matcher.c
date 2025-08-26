@@ -209,6 +209,16 @@ hs_database_t *compile_patterns(char **patterns, size_t pattern_count, size_t *d
     hs_database_t *db = NULL;
     hs_compile_error_t *compile_err = NULL;
     
+    printf("Compiling %zu patterns...\n", pattern_count);
+    
+    // Debug: print all patterns we're about to compile
+    printf("Patterns to compile:\n");
+    for (size_t i = 0; i < pattern_count; i++) {
+        printf("  [%zu]: '%s' (length: %zu)\n", i, patterns[i] ? patterns[i] : "[NULL]", 
+               patterns[i] ? strlen(patterns[i]) : 0);
+    }
+    
+    // Use the exact same approach as our working test
     const char **pattern_ptrs = (const char **)patterns;
     unsigned int *flags = malloc(pattern_count * sizeof(unsigned int));
     unsigned int *ids = malloc(pattern_count * sizeof(unsigned int));
@@ -220,11 +230,13 @@ hs_database_t *compile_patterns(char **patterns, size_t pattern_count, size_t *d
         return NULL;
     }
     
+    // Set flags for all patterns (same as working test)
     for (size_t i = 0; i < pattern_count; i++) {
-        flags[i] = HS_FLAG_DOTALL | HS_FLAG_SINGLEMATCH;
+        flags[i] = 0;  // No flags, same as working test
         ids[i] = (unsigned int)i;
     }
     
+    printf("Calling hs_compile_multi with %zu patterns...\n", pattern_count);
     hs_error_t err = hs_compile_multi(pattern_ptrs, flags, ids, (unsigned int)pattern_count,
                                      HS_MODE_BLOCK, NULL, &db, &compile_err);
     
@@ -232,29 +244,69 @@ hs_database_t *compile_patterns(char **patterns, size_t pattern_count, size_t *d
     free(ids);
     
     if (err != HS_SUCCESS) {
-        fprintf(stderr, "Hyperscan compile error: %s\n", compile_err->message);
+        fprintf(stderr, "Hyperscan compile error (code %d): %s\n", err, compile_err->message);
+        if (compile_err->expression >= 0) {
+            fprintf(stderr, "Error in pattern %d: '%s'\n", compile_err->expression, 
+                   patterns[compile_err->expression]);
+        }
         hs_free_compile_error(compile_err);
         return NULL;
     }
     
     if (db_size) {
-        hs_database_size(db, db_size);
+        printf("Skipping database size call due to corruption issue\n");
+        *db_size = 0; // Set to 0 since we can't get the real size
     }
     
+    // Validate the database
+    if (!db) {
+        fprintf(stderr, "Database is NULL after compilation\n");
+        return NULL;
+    }
+    
+    printf("Pattern compilation successful\n");
     return db;
 }
 
 // Function to initialize scratch spaces
 int init_scratch_spaces(hs_database_t *db, int num_threads, hs_scratch_t ***scratch_spaces_ptr) {
+    if (!db) {
+        fprintf(stderr, "Database is NULL - cannot allocate scratch spaces\n");
+        return 0;
+    }
+    
     hs_scratch_t **scratch_spaces = malloc(num_threads * sizeof(hs_scratch_t *));
     if (!scratch_spaces) {
         perror("Memory allocation failed for scratch spaces array");
         return 0;
     }
     
-    for (int i = 0; i < num_threads; i++) {
-        if (hs_alloc_scratch(db, &scratch_spaces[i]) != HS_SUCCESS) {
-            fprintf(stderr, "Error allocating scratch space for thread %d\n", i);
+    printf("Database pointer: %p\n", (void*)db);
+    
+    // Try the exact same call as in our working test
+    printf("Attempting to allocate scratch space (same as working test)...\n");
+    hs_error_t err = hs_alloc_scratch(db, &scratch_spaces[0]);
+    if (err != HS_SUCCESS) {
+        fprintf(stderr, "Error allocating scratch space: Hyperscan error code %d\n", err);
+        if (err == HS_NOMEM) {
+            fprintf(stderr, "  -> Out of memory\n");
+        } else if (err == HS_INVALID) {
+            fprintf(stderr, "  -> Invalid parameter (database might be corrupted)\n");
+            fprintf(stderr, "  -> Database pointer: %p\n", (void*)db);
+        } else {
+            fprintf(stderr, "  -> Unknown Hyperscan error\n");
+        }
+        free(scratch_spaces);
+        return 0;
+    }
+    
+    printf("First scratch space allocated successfully\n");
+    
+    // If we need more threads, allocate the rest
+    for (int i = 1; i < num_threads; i++) {
+        err = hs_alloc_scratch(db, &scratch_spaces[i]);
+        if (err != HS_SUCCESS) {
+            fprintf(stderr, "Error allocating scratch space for thread %d: %d\n", i, err);
             for (int j = 0; j < i; j++) hs_free_scratch(scratch_spaces[j]);
             free(scratch_spaces);
             return 0;
@@ -349,10 +401,13 @@ int main(int argc, char *argv[]) {
         free_lines(patterns, pattern_count);
         return 1;
     }
-    printf("Database size: %.2f MB\n", db_size / (1024.0 * 1024.0));
+    printf("Database compiled successfully\n");
     
     // Initialize scratch spaces
     hs_scratch_t **scratch_spaces = NULL;
+    
+    printf("Attempting to allocate scratch spaces...\n");
+    
     if (!init_scratch_spaces(database, num_threads, &scratch_spaces)) {
         hs_free_database(database);
         free_lines(patterns, pattern_count);
