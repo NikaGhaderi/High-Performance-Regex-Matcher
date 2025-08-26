@@ -1,0 +1,33 @@
+# Makefile for compiling the CUDA Regex Matcher
+
+# The C++ compiler for CUDA is nvcc
+CXX = nvcc
+
+# The name of your executable
+TARGET = gpu_matcher
+
+# The source file
+SRCS = gpu_matcher.cu
+
+# Compiler flags
+# -std=c++11 is needed for some C++11 features like std::chrono
+# -O3 is the optimization flag
+# We specify the GPU architecture for Hopper (sm_90).
+CXXFLAGS = -std=c++11 -O3 -arch=sm_90 -G -lineinfo
+
+# Linker flags. -lcudart is the CUDA runtime library.
+LDFLAGS = -lcudart
+
+# Default target
+all: $(TARGET)
+
+# Rule to build the executable
+$(TARGET): $(SRCS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+# Rule to clean up build files
+clean:
+	rm -f $(TARGET)
+
+# Phony targets
+.PHONY: all clean
