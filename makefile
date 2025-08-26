@@ -1,6 +1,8 @@
-# Compiler and flags
-CC = gcc
-CFLAGS = -Wall -Wextra -O3 -march=native -pipe -std=c11
+# CFLAGS with -march=native REMOVED to ensure compatibility.
+# -D_GNU_SOURCE is kept here, so it can be removed from the .c file.
+CFLAGS = -Wall -Wextra -O3 -pipe -std=gnu11 -D_GNU_SOURCE
+
+# Linker flags for Hyperscan, pthreads, and math library
 LDFLAGS = -lhs -lpthread -lm
 
 # Project name
@@ -13,38 +15,16 @@ OBJS = $(SRCS:.c=.o)
 # Default target
 all: $(TARGET)
 
-# Create the executable
+# Rule to create the executable
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-# Compile source files
+# Rule to compile source files into object files
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Install dependencies (Hyperscan)
-install-deps:
-	sudo apt update
-	sudo apt install -y libhyperscan-dev
-
-# Clean build files
+# Rule to clean build files
 clean:
 	rm -f $(TARGET) $(OBJS)
 
-# Run with example parameters (adjust as needed)
-run: $(TARGET)
-	./$(TARGET) patterns.txt input.txt output.txt metrics.csv
-
-# Debug build
-debug: CFLAGS += -g -DDEBUG -O0
-debug: $(TARGET)
-
-# Profile build
-profile: CFLAGS += -pg
-profile: LDFLAGS += -pg
-profile: $(TARGET)
-
-# Install to system (optional)
-install: $(TARGET)
-	sudo cp $(TARGET) /usr/local/bin/
-
-.PHONY: all clean install-deps run debug profile install
+.PHONY: all clean
