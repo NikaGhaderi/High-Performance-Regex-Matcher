@@ -1,7 +1,7 @@
 # Compiler and flags
 CC = gcc
 CFLAGS = -Wall -Wextra -O3 -march=native -pipe -std=gnu11
-LDFLAGS = -lhs
+LDFLAGS = -lhs -lpthread
 
 # Hyperscan paths
 HS_INCLUDE = /usr/include/hs
