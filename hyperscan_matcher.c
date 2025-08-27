@@ -25,16 +25,16 @@ typedef struct {
     double processing_time_sec;
 } performance_metrics_t;
 
-// Structure for thread data
+// Thread data structure
 typedef struct {
     int thread_id;
     hs_database_t *database;
-    char **lines;
+    hs_scratch_t *scratch;
+    char **input_lines;
+    match_result_t *results;
     size_t start_line;
     size_t end_line;
-    match_result_t *results;
-    hs_scratch_t *scratch;
-    size_t match_count;
+    size_t local_matches;
 } thread_data_t;
 
 // Match event handler
@@ -54,6 +54,29 @@ static int on_match(unsigned int id, unsigned long long from,
     
     result->matches[result->match_count++] = id;
     return 0; // continue matching
+}
+
+// Thread function to process a range of lines
+void *process_thread(void *arg) {
+    thread_data_t *data = (thread_data_t *)arg;
+    data->local_matches = 0;
+    
+    for (size_t i = data->start_line; i < data->end_line; i++) {
+        match_result_t *result = &data->results[i];
+        result->matches = NULL;
+        result->match_count = 0;
+        
+        hs_error_t err = hs_scan(data->database, data->input_lines[i], strlen(data->input_lines[i]), 
+                                 0, data->scratch, on_match, result);
+        
+        if (err != HS_SUCCESS) {
+            fprintf(stderr, "Hyperscan scan error on line %zu in thread %d: %d\n", i, data->thread_id, err);
+        }
+        
+        data->local_matches += result->match_count;
+    }
+    
+    return NULL;
 }
 
 // Function to read file into an array of lines
@@ -180,31 +203,9 @@ double get_current_time() {
     return tv.tv_sec + tv.tv_usec / 1000000.0;
 }
 
-// Thread function for processing lines
-void *process_lines(void *arg) {
-    thread_data_t *data = (thread_data_t *)arg;
-    
-    for (size_t i = data->start_line; i < data->end_line; i++) {
-        match_result_t *result = &data->results[i];
-        result->matches = NULL;
-        result->match_count = 0;
-        
-        hs_error_t err = hs_scan(data->database, data->lines[i], strlen(data->lines[i]), 
-                                0, data->scratch, on_match, result);
-        
-        if (err != HS_SUCCESS) {
-            fprintf(stderr, "Hyperscan scan error in thread %d: %d\n", data->thread_id, err);
-        }
-        
-        data->match_count += result->match_count;
-    }
-    
-    return NULL;
-}
-
 int main(int argc, char *argv[]) {
-    if (argc < 5) {
-        printf("Usage: %s <patterns_file> <input_file> <output_file> <metrics_file> [threads]\n", argv[0]);
+    if (argc < 5 || argc > 6) {
+        printf("Usage: %s <patterns_file> <input_file> <output_file> <metrics_file> [num_threads]\n", argv[0]);
         return 1;
     }
 
@@ -213,16 +214,14 @@ int main(int argc, char *argv[]) {
     const char *output_file = argv[3];
     const char *metrics_file = argv[4];
     int num_threads = 1;
-    
-    if (argc > 5) {
+    if (argc == 6) {
         num_threads = atoi(argv[5]);
         if (num_threads <= 0) {
-            fprintf(stderr, "Invalid number of threads: %s\n", argv[5]);
-            return 1;
+            fprintf(stderr, "Invalid number of threads, using 1\n");
+            num_threads = 1;
         }
     }
-
-    printf("Running with %d threads\n", num_threads);
+    printf("Using %d threads\n", num_threads);
 
     // Read patterns
     size_t pattern_count, pattern_bytes;
@@ -289,37 +288,37 @@ int main(int argc, char *argv[]) {
     double compile_end_time = get_current_time();
     printf("Patterns compiled successfully in %.3f seconds\n", compile_end_time - compile_start_time);
 
-    // Allocate scratch spaces for threads
-    hs_scratch_t **scratch_spaces = malloc(num_threads * sizeof(hs_scratch_t *));
-    if (!scratch_spaces) {
-        perror("Memory allocation failed for scratch spaces array");
-        hs_free_database(database);
-        free_lines(patterns, pattern_count);
-        free_lines(input_lines, input_line_count);
-        return 1;
-    }
-    
-    // Allocate first scratch space
-    err = hs_alloc_scratch(database, &scratch_spaces[0]);
+    // Allocate prototype scratch space
+    hs_scratch_t *prototype_scratch = NULL;
+    err = hs_alloc_scratch(database, &prototype_scratch);
     if (err != HS_SUCCESS) {
-        fprintf(stderr, "Error allocating first scratch space: %d\n", err);
-        free(scratch_spaces);
+        fprintf(stderr, "Error allocating prototype scratch space: %d\n", err);
         hs_free_database(database);
         free_lines(patterns, pattern_count);
         free_lines(input_lines, input_line_count);
         return 1;
     }
     
-    // Clone scratch spaces for other threads
+    printf("Prototype scratch space allocated successfully\n");
+
+    // Allocate per-thread scratch spaces
+    hs_scratch_t **scratches = malloc(num_threads * sizeof(hs_scratch_t *));
+    if (!scratches) {
+        perror("Memory allocation failed for scratches");
+        hs_free_scratch(prototype_scratch);
+        hs_free_database(database);
+        free_lines(patterns, pattern_count);
+        free_lines(input_lines, input_line_count);
+        return 1;
+    }
+    
+    scratches[0] = prototype_scratch;
     for (int i = 1; i < num_threads; i++) {
-        err = hs_clone_scratch(scratch_spaces[0], &scratch_spaces[i]);
+        err = hs_clone_scratch(prototype_scratch, &scratches[i]);
         if (err != HS_SUCCESS) {
             fprintf(stderr, "Error cloning scratch space for thread %d: %d\n", i, err);
-            // Clean up already allocated scratch spaces
-            for (int j = 0; j < i; j++) {
-                hs_free_scratch(scratch_spaces[j]);
-            }
-            free(scratch_spaces);
+            for (int j = 0; j < i; j++) hs_free_scratch(scratches[j]);
+            free(scratches);
             hs_free_database(database);
             free_lines(patterns, pattern_count);
             free_lines(input_lines, input_line_count);
@@ -327,16 +326,14 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    printf("Scratch spaces allocated successfully\n");
+    printf("All scratch spaces cloned successfully\n");
 
     // Allocate memory for results
     match_result_t *results = calloc(input_line_count, sizeof(match_result_t));
     if (!results) {
         perror("Memory allocation failed for results");
-        for (int i = 0; i < num_threads; i++) {
-            hs_free_scratch(scratch_spaces[i]);
-        }
-        free(scratch_spaces);
+        for (int i = 0; i < num_threads; i++) hs_free_scratch(scratches[i]);
+        free(scratches);
         hs_free_database(database);
         free_lines(patterns, pattern_count);
         free_lines(input_lines, input_line_count);
@@ -347,48 +344,45 @@ int main(int argc, char *argv[]) {
     double scan_start_time = get_current_time();
     size_t total_matches = 0;
 
-    // Create threads and distribute work
+    // Create threads
     pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
     thread_data_t *thread_data = malloc(num_threads * sizeof(thread_data_t));
-    
     if (!threads || !thread_data) {
-        perror("Memory allocation failed for thread data");
-        for (int i = 0; i < num_threads; i++) {
-            hs_free_scratch(scratch_spaces[i]);
-        }
-        free(scratch_spaces);
+        perror("Memory allocation failed for threads");
+        free(results);
+        for (int i = 0; i < num_threads; i++) hs_free_scratch(scratches[i]);
+        free(scratches);
         hs_free_database(database);
         free_lines(patterns, pattern_count);
         free_lines(input_lines, input_line_count);
-        free(results);
         free(threads);
         free(thread_data);
         return 1;
     }
-    
+
     size_t lines_per_thread = input_line_count / num_threads;
     size_t remainder = input_line_count % num_threads;
     size_t current_start = 0;
-    
+
     for (int i = 0; i < num_threads; i++) {
         thread_data[i].thread_id = i;
         thread_data[i].database = database;
-        thread_data[i].lines = input_lines;
+        thread_data[i].scratch = scratches[i];
+        thread_data[i].input_lines = input_lines;
+        thread_data[i].results = results;
         thread_data[i].start_line = current_start;
         thread_data[i].end_line = current_start + lines_per_thread + (i < remainder ? 1 : 0);
-        thread_data[i].results = results;
-        thread_data[i].scratch = scratch_spaces[i];
-        thread_data[i].match_count = 0;
-        
+        thread_data[i].local_matches = 0;
+
         current_start = thread_data[i].end_line;
-        
-        pthread_create(&threads[i], NULL, process_lines, &thread_data[i]);
+
+        pthread_create(&threads[i], NULL, process_thread, &thread_data[i]);
     }
-    
-    // Wait for all threads to complete
+
+    // Join threads and sum matches
     for (int i = 0; i < num_threads; i++) {
         pthread_join(threads[i], NULL);
-        total_matches += thread_data[i].match_count;
+        total_matches += thread_data[i].local_matches;
     }
 
     double scan_end_time = get_current_time();
@@ -422,7 +416,6 @@ int main(int argc, char *argv[]) {
 
     // Print performance summary
     printf("\n=== PERFORMANCE SUMMARY ===\n");
-    printf("Threads: %d\n", num_threads);
     printf("Processing time: %.3f seconds\n", metrics.processing_time_sec);
     printf("Total input lines: %zu\n", metrics.total_input_lines);
     printf("Total input bytes: %zu (%.2f MB)\n", 
@@ -435,21 +428,19 @@ int main(int argc, char *argv[]) {
     printf("===========================\n");
 
     // Clean up
+    free(threads);
+    free(thread_data);
     for (size_t i = 0; i < input_line_count; i++) {
         free(results[i].matches);
     }
     free(results);
-    
     for (int i = 0; i < num_threads; i++) {
-        hs_free_scratch(scratch_spaces[i]);
+        hs_free_scratch(scratches[i]);
     }
-    free(scratch_spaces);
-    
+    free(scratches);
     hs_free_database(database);
     free_lines(patterns, pattern_count);
     free_lines(input_lines, input_line_count);
-    free(threads);
-    free(thread_data);
 
     printf("Processing completed successfully\n");
     return 0;
