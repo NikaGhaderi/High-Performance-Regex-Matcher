@@ -4,12 +4,25 @@
 #include <string.h>
 #include <hs.h>
 #include <time.h>
+#include <sys/time.h>
 
 // Structure to hold match information
 typedef struct {
     unsigned int *matches;
     size_t match_count;
 } match_result_t;
+
+// Structure to hold performance metrics
+typedef struct {
+    double throughput_input_per_sec;
+    double throughput_mbytes_per_sec;
+    double throughput_match_per_sec;
+    double latency_ms;
+    size_t total_matches;
+    size_t total_input_bytes;
+    size_t total_input_lines;
+    double processing_time_sec;
+} performance_metrics_t;
 
 // Match event handler
 static int on_match(unsigned int id, unsigned long long from, 
@@ -97,14 +110,74 @@ void free_lines(char **lines, size_t count) {
     free(lines);
 }
 
+// Function to write output file
+int write_output(const char *filename, match_result_t *results, size_t count) {
+    FILE *file = fopen(filename, "w");
+    if (!file) {
+        perror("Error opening output file");
+        return 0;
+    }
+    
+    for (size_t i = 0; i < count; i++) {
+        if (results[i].match_count > 0) {
+            for (size_t j = 0; j < results[i].match_count; j++) {
+                fprintf(file, "%u", results[i].matches[j]);
+                if (j < results[i].match_count - 1) {
+                    fprintf(file, ",");
+                }
+            }
+        }
+        fprintf(file, "\n");
+    }
+    
+    fclose(file);
+    return 1;
+}
+
+// Function to write performance metrics to CSV
+int write_metrics(const char *filename, int threads, performance_metrics_t *metrics) {
+    FILE *file = fopen(filename, "a");
+    if (!file) {
+        perror("Error opening metrics file");
+        return 0;
+    }
+    
+    // Write header if file is empty
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    if (file_size == 0) {
+        fprintf(file, "threads,throughput_input_per_sec,throughput_mbytes_per_sec,throughput_match_per_sec,latency\n");
+    }
+    
+    fprintf(file, "%d,%.2f,%.2f,%.2f,%.2f\n", 
+            threads, 
+            metrics->throughput_input_per_sec,
+            metrics->throughput_mbytes_per_sec,
+            metrics->throughput_match_per_sec,
+            metrics->latency_ms);
+    
+    fclose(file);
+    return 1;
+}
+
+// Function to get current time in seconds with high precision
+double get_current_time() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec / 1000000.0;
+}
+
 int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        printf("Usage: %s <patterns_file> <input_file>\n", argv[0]);
+    if (argc != 5) {
+        printf("Usage: %s <patterns_file> <input_file> <output_file> <metrics_file>\n", argv[0]);
         return 1;
     }
 
     const char *patterns_file = argv[1];
     const char *input_file = argv[2];
+    const char *output_file = argv[3];
+    const char *metrics_file = argv[4];
+    int num_threads = 1; // Single-threaded for now
 
     // Read patterns
     size_t pattern_count, pattern_bytes;
@@ -123,7 +196,7 @@ int main(int argc, char *argv[]) {
         free_lines(patterns, pattern_count);
         return 1;
     }
-    printf("Loaded %zu input lines\n", input_line_count);
+    printf("Loaded %zu input lines, total %zu bytes\n", input_line_count, input_bytes);
 
     // Convert patterns to Hyperscan format
     const char **pattern_ptrs = malloc(pattern_count * sizeof(const char *));
@@ -146,6 +219,9 @@ int main(int argc, char *argv[]) {
         ids[i] = i;
     }
 
+    // Start timing for pattern compilation
+    double compile_start_time = get_current_time();
+    
     // Compile patterns
     hs_database_t *database = NULL;
     hs_compile_error_t *compile_err = NULL;
@@ -165,7 +241,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    printf("Patterns compiled successfully\n");
+    double compile_end_time = get_current_time();
+    printf("Patterns compiled successfully in %.3f seconds\n", compile_end_time - compile_start_time);
 
     // Allocate scratch space
     hs_scratch_t *scratch = NULL;
@@ -180,32 +257,83 @@ int main(int argc, char *argv[]) {
     
     printf("Scratch space allocated successfully\n");
 
+    // Allocate memory for results
+    match_result_t *results = calloc(input_line_count, sizeof(match_result_t));
+    if (!results) {
+        perror("Memory allocation failed for results");
+        hs_free_scratch(scratch);
+        hs_free_database(database);
+        free_lines(patterns, pattern_count);
+        free_lines(input_lines, input_line_count);
+        return 1;
+    }
+
+    // Start timing for scanning
+    double scan_start_time = get_current_time();
+    size_t total_matches = 0;
+
     // Process each input line
     for (size_t i = 0; i < input_line_count; i++) {
-        match_result_t result = {NULL, 0};
+        match_result_t *result = &results[i];
+        result->matches = NULL;
+        result->match_count = 0;
         
-        err = hs_scan(database, input_lines[i], strlen(input_lines[i]), 0, scratch, on_match, &result);
+        err = hs_scan(database, input_lines[i], strlen(input_lines[i]), 0, scratch, on_match, result);
         
         if (err != HS_SUCCESS) {
             fprintf(stderr, "Hyperscan scan error on line %zu: %d\n", i, err);
-        } else {
-            // Print matches for this line
-            printf("Line %zu: ", i);
-            if (result.match_count > 0) {
-                for (size_t j = 0; j < result.match_count; j++) {
-                    printf("%u", result.matches[j]);
-                    if (j < result.match_count - 1) {
-                        printf(",");
-                    }
-                }
-            }
-            printf("\n");
         }
         
-        free(result.matches);
+        total_matches += result->match_count;
     }
 
+    double scan_end_time = get_current_time();
+    double processing_time = scan_end_time - scan_start_time;
+
+    // Calculate performance metrics
+    performance_metrics_t metrics;
+    metrics.total_input_lines = input_line_count;
+    metrics.total_input_bytes = input_bytes;
+    metrics.total_matches = total_matches;
+    metrics.processing_time_sec = processing_time;
+    
+    metrics.throughput_input_per_sec = input_line_count / processing_time;
+    metrics.throughput_mbytes_per_sec = (input_bytes / (1024.0 * 1024.0)) / processing_time;
+    metrics.throughput_match_per_sec = total_matches / processing_time;
+    metrics.latency_ms = (processing_time * 1000.0) / input_line_count;
+
+    // Write output file
+    if (!write_output(output_file, results, input_line_count)) {
+        fprintf(stderr, "Error writing output file\n");
+    } else {
+        printf("Output written to %s\n", output_file);
+    }
+
+    // Write metrics to CSV
+    if (!write_metrics(metrics_file, num_threads, &metrics)) {
+        fprintf(stderr, "Error writing metrics file\n");
+    } else {
+        printf("Metrics written to %s\n", metrics_file);
+    }
+
+    // Print performance summary
+    printf("\n=== PERFORMANCE SUMMARY ===\n");
+    printf("Processing time: %.3f seconds\n", metrics.processing_time_sec);
+    printf("Total input lines: %zu\n", metrics.total_input_lines);
+    printf("Total input bytes: %zu (%.2f MB)\n", 
+           metrics.total_input_bytes, metrics.total_input_bytes / (1024.0 * 1024.0));
+    printf("Total matches: %zu\n", metrics.total_matches);
+    printf("Throughput (input/sec): %.2f\n", metrics.throughput_input_per_sec);
+    printf("Throughput (MB/sec): %.2f\n", metrics.throughput_mbytes_per_sec);
+    printf("Throughput (matches/sec): %.2f\n", metrics.throughput_match_per_sec);
+    printf("Latency (ms/line): %.2f\n", metrics.latency_ms);
+    printf("===========================\n");
+
     // Clean up
+    for (size_t i = 0; i < input_line_count; i++) {
+        free(results[i].matches);
+    }
+    free(results);
     hs_free_scratch(scratch);
     hs_free_database(database);
     free_lines(patterns, pattern_count);

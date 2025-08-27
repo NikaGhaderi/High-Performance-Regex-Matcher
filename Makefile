@@ -1,6 +1,6 @@
 # Compiler and flags
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -std=gnu11
+CFLAGS = -Wall -Wextra -O3 -march=native -pipe -std=gnu11
 LDFLAGS = -lhs
 
 # Hyperscan paths
@@ -12,10 +12,10 @@ CFLAGS += -I$(HS_INCLUDE)
 LDFLAGS += -L$(HS_LIB)
 
 # Project name
-TARGET = simple_hs_matcher
+TARGET = hyperscan_matcher
 
 # Source files
-SRCS = simple_hs_matcher.c
+SRCS = hyperscan_matcher.c
 OBJS = $(SRCS:.c=.o)
 
 # Default target
