@@ -12,8 +12,8 @@ SRCS = gpu_matcher.cu
 # Compiler flags
 # -std=c++11 is needed for some C++11 features like std::chrono
 # -O3 is the optimization flag
-# We specify the GPU architecture for Hopper (sm_90).
-CXXFLAGS = -std=c++11 -O3 -arch=sm_90 -G -lineinfo
+# We specify the GPU architecture for T4 (sm_75).
+CXXFLAGS = -std=c++11 -O3 -gencode arch=compute_75,code=sm_75 -lineinfo
 
 # Linker flags. -lcudart is the CUDA runtime library.
 LDFLAGS = -lcudart
